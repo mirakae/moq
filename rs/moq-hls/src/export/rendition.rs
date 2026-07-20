@@ -188,13 +188,13 @@ impl Rendition {
 	/// Resolve once the playlist is renderable ([`is_playable`](Self::is_playable)). Bounding
 	/// the wait is the caller's policy (the serve path wraps this in its own timeout).
 	#[cfg_attr(not(feature = "server"), allow(dead_code))]
-	pub(crate) async fn playable(&self) {
+	pub async fn playable(&self) {
 		kio::wait(|waiter| self.live.poll_playable(waiter)).await;
 	}
 
 	/// Render the media playlist from the current timeline window.
 	#[cfg_attr(not(feature = "server"), allow(dead_code))]
-	pub(crate) fn playlist(&self) -> Snapshot {
+	pub fn playlist(&self) -> Snapshot {
 		let window = self.live.window();
 
 		// EXT-X-TARGETDURATION must be >= every segment's duration and, per the HLS spec, must not
@@ -229,7 +229,7 @@ impl Rendition {
 	/// Whether the playlist has anything to serve yet (at least one complete segment, or the
 	/// broadcast already ended).
 	#[cfg_attr(not(feature = "server"), allow(dead_code))]
-	pub(crate) fn is_playable(&self) -> bool {
+	pub fn is_playable(&self) -> bool {
 		self.live.is_playable()
 	}
 
@@ -260,7 +260,7 @@ impl Rendition {
 	///
 	/// For inline-parameter-set codecs (no catalog `description`), the parameter sets are
 	/// resolved by fetching the newest complete segment's group first.
-	pub(crate) async fn init(&self) -> Result<Option<Bytes>> {
+	pub async fn init(&self) -> Result<Option<Bytes>> {
 		let mut cache = self.init.lock().await;
 		if let Some(bytes) = cache.as_ref() {
 			return Ok(Some(bytes.clone()));
@@ -301,7 +301,7 @@ impl Rendition {
 	/// Fetches every group the segment covers (audio timelines skip groups, so a segment may span
 	/// several) and encodes them as a single CMAF fragment. `None` when the segment isn't in the
 	/// playlist window or its groups already left the relay cache.
-	pub(crate) async fn segment(&self, sequence: u64) -> Result<Option<Bytes>> {
+	pub async fn segment(&self, sequence: u64) -> Result<Option<Bytes>> {
 		let Some((start, end)) = self.live.segment_groups(sequence) else {
 			return Ok(None);
 		};

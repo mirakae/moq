@@ -12,13 +12,23 @@
 //! `{kind}` is `video` or `audio`, so a video and an audio rendition that share a
 //! name address distinct resources.
 //!
-//! Every request is served. To gate access, wrap [`Server::router`] in your own
-//! [`axum`] middleware. It runs before routing, so a rejected request never reaches
-//! the origin, but it also sees the raw request URI rather than the path parameters
-//! axum decodes for the handlers. The broadcast is the first segment, still
-//! percent-encoded: `/li%76e/master.m3u8` serves the broadcast `live`. Decode a
-//! segment before matching it against a policy, or a name can be encoded past the
-//! check.
+//! [`Server::router`] serves every request. There are two ways to gate access:
+//!
+//! - **Wrap the router in your own [`axum`] middleware.** It runs before routing, so a
+//!   rejected request never reaches the origin, but it also sees the raw request URI
+//!   rather than the path parameters axum decodes for the handlers. The broadcast is the
+//!   first segment, still percent-encoded: `/li%76e/master.m3u8` serves the broadcast
+//!   `live`. Decode a segment before matching it against a policy, or a name can be
+//!   encoded past the check.
+//! - **Drive the broadcaster pool from your own handlers.** [`Server::broadcaster`]
+//!   resolves (and caches, with fanout) a [`Broadcaster`] by name; the [`Broadcaster`]
+//!   and [`Rendition`](crate::export::Rendition) accessors render playlists and fetch
+//!   segments. Build your own router over them when you want to authorize each request
+//!   against decoded path parameters (verify a token, check its scope) as ordinary
+//!   inline code, with no policy hook wired into this crate. This is the path a relay
+//!   embedding takes to reuse its existing auth. Credentials are propagated to child
+//!   URLs by passing a `query` to the renderers; see [`Broadcaster::master_playlist`]
+//!   and [`crate::export::render_media`].
 //!
 //! ```no_run
 //! use axum::http::StatusCode;
@@ -84,7 +94,13 @@ impl Server {
 	/// Get or create the [`Broadcaster`] for `name`, resolving the broadcast from
 	/// the relay (waiting briefly for its announcement). Returns `None` if the
 	/// broadcast never shows up.
-	pub(crate) async fn broadcaster(&self, name: &str) -> Option<Arc<Broadcaster>> {
+	///
+	/// The instance is cached and shared: concurrent requests for the same broadcast
+	/// get one [`Broadcaster`] (and thus one upstream subscription that fans out to
+	/// every viewer), evicted when the broadcast closes. This is the entry point for
+	/// building a custom HTTP surface over the pool (see the module docs) rather than
+	/// using [`router`](Self::router) directly.
+	pub async fn broadcaster(&self, name: &str) -> Option<Arc<Broadcaster>> {
 		{
 			let mut broadcasters = self.inner.broadcasters.lock().unwrap();
 			if let Some(existing) = broadcasters.get(name) {

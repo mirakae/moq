@@ -144,9 +144,9 @@ impl Broadcaster {
 		master::render_master(&video, &audio, query)
 	}
 
-	/// Whether the current catalog contains no servable renditions (serve path).
-	#[cfg_attr(not(feature = "server"), allow(dead_code))]
-	pub(crate) fn is_empty(&self) -> bool {
+	/// Whether the current catalog contains no servable renditions, so a custom
+	/// surface can 404 a master playlist that would otherwise list nothing.
+	pub fn is_empty(&self) -> bool {
 		self.renditions.is_empty()
 	}
 }
