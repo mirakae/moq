@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -29,7 +29,7 @@ pub fn router(server: Server) -> Router {
 		.with_state(server)
 }
 
-async fn master(State(server): State<Server>, Path(broadcast): Path<String>) -> Response {
+async fn master(State(server): State<Server>, Path(broadcast): Path<String>, RawQuery(query): RawQuery) -> Response {
 	let Some(broadcaster) = server.broadcaster(&broadcast).await else {
 		return not_found();
 	};
@@ -37,12 +37,15 @@ async fn master(State(server): State<Server>, Path(broadcast): Path<String>) -> 
 	if broadcaster.is_empty() {
 		return not_found();
 	}
-	m3u8(broadcaster.master_playlist())
+	// Propagate whatever query reached the master (e.g. a credential a wrapping
+	// middleware required) down to the child media-playlist URLs.
+	m3u8(broadcaster.master_playlist(query.as_deref()))
 }
 
 async fn media(
 	State(server): State<Server>,
 	Path((broadcast, kind, rendition)): Path<(String, String, String)>,
+	RawQuery(query): RawQuery,
 ) -> Response {
 	let Some(rendition) = rendition_for(&server, &broadcast, &kind, &rendition).await else {
 		return not_found();
@@ -64,7 +67,7 @@ async fn media(
 		Err(err) => return server_error(err),
 	}
 
-	m3u8(crate::export::render_media(&rendition.playlist()))
+	m3u8(crate::export::render_media(&rendition.playlist(), query.as_deref()))
 }
 
 async fn init(
