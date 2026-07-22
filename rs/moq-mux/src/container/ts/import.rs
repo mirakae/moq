@@ -125,6 +125,9 @@ pub struct Import<E: catalog::Catalog = ()> {
 	/// time instead of one group per packet. See `codec::aac::import::Import`
 	/// for the latency/resilience trade-off.
 	audio_group_interval: Option<Timestamp>,
+	/// When true, SCTE-35 `Splice Null` (heartbeat, command_type 0x00) sections
+	/// are filtered out and not published.
+	filter_scte35_null: bool,
 }
 
 impl<E: catalog::Catalog> Import<E> {
@@ -162,6 +165,7 @@ impl<E: catalog::Catalog> Import<E> {
 			media_unwrap: PtsUnwrap::default(),
 			scte35_pid: None,
 			audio_group_interval: None,
+			filter_scte35_null: false,
 		}
 	}
 
@@ -171,6 +175,12 @@ impl<E: catalog::Catalog> Import<E> {
 	/// section, in addition to the usual `mpegts.tracks` bookkeeping.
 	pub fn with_scte35_pid(mut self, pid: Option<u16>) -> Self {
 		self.scte35_pid = pid;
+		self
+	}
+
+	/// Filter out SCTE-35 `Splice Null` (heartbeat / keep-alive) sections.
+	pub fn with_filter_scte35_null(mut self, filter: bool) -> Self {
+		self.filter_scte35_null = filter;
 		self
 	}
 
@@ -493,6 +503,7 @@ impl<E: catalog::Catalog> Import<E> {
 			stream_type,
 			descriptors,
 			self.scte35_pid,
+			self.filter_scte35_null,
 		)?;
 		self.sections.insert(pid.as_u16(), stream);
 		self.initialized = true;
@@ -831,6 +842,7 @@ struct SectionStream<E: catalog::Catalog> {
 	/// Held for its `Drop`, which clears this track's catalog entry.
 	_entry: VerbatimEntry<E>,
 	reassembler: SectionReassembler,
+	filter_scte35_null: bool,
 }
 
 impl<E: catalog::Catalog> SectionStream<E> {
@@ -841,6 +853,7 @@ impl<E: catalog::Catalog> SectionStream<E> {
 		stream_type: u8,
 		descriptors: Vec<catalog::Descriptor>,
 		scte35_pid: Option<u16>,
+		filter_scte35_null: bool,
 	) -> anyhow::Result<Self> {
 		let track = register_verbatim(
 			&mut broadcast,
@@ -859,6 +872,7 @@ impl<E: catalog::Catalog> SectionStream<E> {
 			track,
 			_entry: entry,
 			reassembler: SectionReassembler::default(),
+			filter_scte35_null,
 		})
 	}
 
@@ -876,6 +890,12 @@ impl<E: catalog::Catalog> SectionStream<E> {
 
 	/// Publish one complete section as a frame in its own group.
 	fn emit(&mut self, section: Vec<u8>, pts: Timestamp) -> anyhow::Result<()> {
+		// Filter out SCTE-35 `Splice Null` (table_id 0xFC, splice_command_type 0x00) if configured
+		if self.filter_scte35_null && is_scte35_splice_null(&section) {
+			tracing::trace!("dropping SCTE-35 Splice Null section");
+			return Ok(());
+		}
+
 		let frame = crate::container::Frame {
 			timestamp: pts,
 			duration: None,
@@ -2533,4 +2553,20 @@ mod test {
 			.expect("a published verbatim frame");
 		assert_eq!(&frame.payload[..], &payload[..], "verbatim PES payload round-trips");
 	}
+}
+
+/// Helper to inspect reassembled section bytes and check if it's an SCTE-35 `Splice Null`
+/// (table_id 0xFC, splice_command_type 0x00).
+fn is_scte35_splice_null(section: &[u8]) -> bool {
+	// Must have table_id 0xFC (SCTE-35 splice_info_section) and at least 14 bytes for an unencrypted header
+	if section.len() < 14 || section[0] != 0xFC {
+		return false;
+	}
+	let encrypted_packet = (section[3] & 0x02) != 0;
+	if encrypted_packet {
+		return false;
+	}
+	// splice_command_type is at byte index 13
+	let command_type = section[13];
+	command_type == 0x00 // 0x00 is Splice Null
 }

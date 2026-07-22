@@ -152,6 +152,7 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
 			&format,
 			import.source.scte35_pid(),
 			import.source.audio_group_interval_ms(),
+			import.source.filter_scte35_null(),
 		)?);
 	} else {
 		match import.source {

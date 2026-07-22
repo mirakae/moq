@@ -168,6 +168,12 @@ pub struct TsArgs {
 	/// enabling this on a low-latency broadcast.
 	#[arg(long = "audio-group-interval-ms")]
 	pub audio_group_interval_ms: Option<u64>,
+
+	/// Filter out SCTE-35 `Splice Null` (heartbeat / keep-alive) sections.
+	/// When set, periodic empty cue sections (command_type 0x00) are dropped
+	/// before publishing, reducing track overhead when no ad breaks are active.
+	#[arg(long = "filter-scte35-null")]
+	pub filter_scte35_null: bool,
 }
 
 impl ImportSource {
@@ -195,6 +201,14 @@ impl ImportSource {
 		match self {
 			Self::Ts(args) => args.audio_group_interval_ms,
 			_ => None,
+		}
+	}
+
+	/// Whether SCTE-35 `Splice Null` sections should be filtered out, when this source is `ts`.
+	pub fn filter_scte35_null(&self) -> bool {
+		match self {
+			Self::Ts(args) => args.filter_scte35_null,
+			_ => false,
 		}
 	}
 }
