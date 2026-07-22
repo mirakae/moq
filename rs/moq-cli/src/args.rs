@@ -131,7 +131,7 @@ pub enum ImportSource {
 	/// Fragmented MP4 / CMAF from stdin.
 	Fmp4,
 	/// MPEG-TS from stdin.
-	Ts,
+	Ts(TsArgs),
 	/// FLV / RTMP container from stdin.
 	Flv,
 	/// Pull a remote HLS / LL-HLS playlist (http/https URL or local file) into MoQ.
@@ -148,16 +148,54 @@ pub enum ImportSource {
 	Capture(crate::publish::CaptureArgs),
 }
 
+/// Options for `import ts`.
+#[derive(Args, Clone, Default)]
+pub struct TsArgs {
+	/// PID of the SCTE-35 channel, when the source doesn't announce it with the
+	/// standard CUEI PMT registration descriptor (e.g. a non-conformant mux
+	/// carrying it as generic private data, stream_type 6). When set, the
+	/// catalog publishes a root-level `scte35` section pointing at the track,
+	/// in addition to the usual `mpegts.tracks` bookkeeping.
+	#[arg(long = "scte35-pid")]
+	pub scte35_pid: Option<u16>,
+
+	/// Batch AAC packets into groups spanning this many milliseconds of
+	/// presentation time, instead of one group per packet (the default when
+	/// unset). Set this to match the video encoder's GOP duration in
+	/// milliseconds (e.g. `--audio-group-interval-ms 1000` for a 1s GOP), so
+	/// audio and video groups close at roughly the same cadence. See the
+	/// latency/resilience trade-off in `codec::aac::import::Import` before
+	/// enabling this on a low-latency broadcast.
+	#[arg(long = "audio-group-interval-ms")]
+	pub audio_group_interval_ms: Option<u64>,
+}
+
 impl ImportSource {
 	/// The stdin container format, when this source is one of the container formats.
 	pub fn stdin_format(&self) -> Option<PublishFormat> {
 		Some(match self {
 			Self::Avc3 => PublishFormat::Avc3,
 			Self::Fmp4 => PublishFormat::Fmp4,
-			Self::Ts => PublishFormat::Ts,
+			Self::Ts(_) => PublishFormat::Ts,
 			Self::Flv => PublishFormat::Flv,
 			_ => return None,
 		})
+	}
+
+	/// The configured SCTE-35 PID, when this source is `ts`.
+	pub fn scte35_pid(&self) -> Option<u16> {
+		match self {
+			Self::Ts(args) => args.scte35_pid,
+			_ => None,
+		}
+	}
+
+	/// The configured audio group interval in milliseconds, when this source is `ts`.
+	pub fn audio_group_interval_ms(&self) -> Option<u64> {
+		match self {
+			Self::Ts(args) => args.audio_group_interval_ms,
+			_ => None,
+		}
 	}
 }
 

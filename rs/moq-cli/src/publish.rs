@@ -217,7 +217,12 @@ pub struct Publish {
 impl Publish {
 	/// Build a publisher decoding the given container format from stdin into
 	/// `broadcast` (typically created on the origin that announces it).
-	pub fn new(mut broadcast: moq_net::broadcast::Producer, format: &PublishFormat) -> anyhow::Result<Self> {
+	pub fn new(
+		mut broadcast: moq_net::broadcast::Producer,
+		format: &PublishFormat,
+		scte35_pid: Option<u16>,
+		audio_group_interval_ms: Option<u64>,
+	) -> anyhow::Result<Self> {
 		// TS carries undecoded elementary streams (SCTE-35, teletext, DVB AC-3, ...)
 		// verbatim, so it uses the `mpegts` catalog extension rather than the media-only
 		// `()`. The catalog producer owns the broadcast's catalog tracks, so each broadcast
@@ -227,7 +232,9 @@ impl Publish {
 				&mut broadcast,
 				moq_mux::catalog::hang::Catalog::<ts::Ext>::default(),
 			)?;
-			let ts = ts::Import::new(broadcast.clone(), catalog.reserve());
+			let ts = ts::Import::new(broadcast.clone(), catalog.reserve())
+				.with_scte35_pid(scte35_pid)
+				.with_audio_group_interval_ms(audio_group_interval_ms)?;
 			return Ok(Self {
 				source: Source::Stream(PublishDecoder::Ts(Box::new(ts))),
 				broadcast,
@@ -577,7 +584,7 @@ mod tests {
 			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
 			.unwrap();
 		settle().await;
-		let mut publish = Publish::new(broadcast, &PublishFormat::Ts).unwrap();
+		let mut publish = Publish::new(broadcast, &PublishFormat::Ts, None, None).unwrap();
 		#[allow(irrefutable_let_patterns)]
 		let Source::Stream(decoder) = &mut publish.source else {
 			panic!("expected a stream source");

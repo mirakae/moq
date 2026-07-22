@@ -255,6 +255,22 @@ pub struct Descriptor {
 	pub data: Bytes,
 }
 
+/// Reference to the SCTE-35 verbatim track, published at the catalog root when
+/// the importer has been told which PID carries it (the source lacks a CUEI
+/// registration descriptor, so it can't be auto-detected from the PMT alone).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct Scte35 {
+	/// The MoQ track name carrying the verbatim payload (also present, keyed
+	/// the same way, under `mpegts.tracks`).
+	pub track: String,
+	/// Original MPEG-TS PID, for cross-reference / debugging.
+	pub pid: u16,
+	/// PMT `stream_type` as carried (e.g. 6 for a non-conformant private-PES mux).
+	pub stream_type: u8,
+}
+
 /// The application catalog extension carrying the `mpegts` section. Empty by
 /// default, so the section is omitted until an MPEG-TS detail is recorded.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
@@ -262,6 +278,12 @@ pub struct Descriptor {
 pub struct Ext {
 	#[serde(default, skip_serializing_if = "Mpegts::is_empty")]
 	pub mpegts: Mpegts,
+
+	/// Root-level pointer to the SCTE-35 track, when identified. Kept separate
+	/// from `mpegts` so a consumer can find it without parsing the generic
+	/// verbatim-track bookkeeping.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub scte35: Option<Scte35>,
 }
 
 impl CatalogExt for Ext {}
@@ -278,6 +300,10 @@ pub trait Catalog: CatalogExt {
 	/// construction, so a result that flips between `Some` and `None` mid-stream
 	/// would disable verbatim carriage or fail.
 	fn mpegts_mut(&mut self) -> Option<&mut Mpegts>;
+
+	fn scte35_mut(&mut self) -> Option<&mut Option<Scte35>> {
+		None
+	}
 }
 
 impl Catalog for () {
@@ -297,6 +323,10 @@ impl Catalog for crate::catalog::hang::Extra {
 impl Catalog for Ext {
 	fn mpegts_mut(&mut self) -> Option<&mut Mpegts> {
 		Some(&mut self.mpegts)
+	}
+
+	fn scte35_mut(&mut self) -> Option<&mut Option<Scte35>> {
+		Some(&mut self.scte35)
 	}
 }
 
@@ -341,7 +371,11 @@ mod test {
 			data: Bytes::from_static(b"CUEI"),
 		});
 
-		let json = serde_json::to_string(&Ext { mpegts: mpegts.clone() }).unwrap();
+		let json = serde_json::to_string(&Ext {
+			mpegts: mpegts.clone(),
+			scte35: None,
+		})
+		.unwrap();
 		// Descriptor bytes are base64 ("CUEI" -> "Q1VFSQ==").
 		assert!(json.contains("\"Q1VFSQ==\""), "descriptor data is base64: {json}");
 

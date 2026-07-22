@@ -1,0 +1,458 @@
+diff --git a/rs/moq-cli/src/args.rs b/rs/moq-cli/src/args.rs
+index 79c00832..52f0f6bb 100644
+--- a/rs/moq-cli/src/args.rs
++++ b/rs/moq-cli/src/args.rs
+@@ -131,7 +131,7 @@ pub enum ImportSource {
+ 	/// Fragmented MP4 / CMAF from stdin.
+ 	Fmp4,
+ 	/// MPEG-TS from stdin.
+-	Ts,
++	Ts(TsArgs),
+ 	/// FLV / RTMP container from stdin.
+ 	Flv,
+ 	/// Pull a remote HLS / LL-HLS playlist (http/https URL or local file) into MoQ.
+@@ -148,17 +148,55 @@ pub enum ImportSource {
+ 	Capture(crate::publish::CaptureArgs),
+ }
+ 
++/// Options for `import ts`.
++#[derive(Args, Clone, Default)]
++pub struct TsArgs {
++	/// PID of the SCTE-35 channel, when the source doesn't announce it with the
++	/// standard CUEI PMT registration descriptor (e.g. a non-conformant mux
++	/// carrying it as generic private data, stream_type 6). When set, the
++	/// catalog publishes a root-level `scte35` section pointing at the track,
++	/// in addition to the usual `mpegts.tracks` bookkeeping.
++	#[arg(long = "scte35-pid")]
++	pub scte35_pid: Option<u16>,
++
++	/// Batch AAC packets into groups spanning this many milliseconds of
++	/// presentation time, instead of one group per packet (the default when
++	/// unset). Set this to match the video encoder's GOP duration in
++	/// milliseconds (e.g. `--audio-group-interval-ms 1000` for a 1s GOP), so
++	/// audio and video groups close at roughly the same cadence. See the
++	/// latency/resilience trade-off in `codec::aac::import::Import` before
++	/// enabling this on a low-latency broadcast.
++	#[arg(long = "audio-group-interval-ms")]
++	pub audio_group_interval_ms: Option<u64>,
++}
++
+ impl ImportSource {
+ 	/// The stdin container format, when this source is one of the container formats.
+ 	pub fn stdin_format(&self) -> Option<PublishFormat> {
+ 		Some(match self {
+ 			Self::Avc3 => PublishFormat::Avc3,
+ 			Self::Fmp4 => PublishFormat::Fmp4,
+-			Self::Ts => PublishFormat::Ts,
++			Self::Ts(_) => PublishFormat::Ts,
+ 			Self::Flv => PublishFormat::Flv,
+ 			_ => return None,
+ 		})
+ 	}
++
++	/// The configured SCTE-35 PID, when this source is `ts`.
++	pub fn scte35_pid(&self) -> Option<u16> {
++		match self {
++			Self::Ts(args) => args.scte35_pid,
++			_ => None,
++		}
++	}
++
++	/// The configured audio group interval in milliseconds, when this source is `ts`.
++	pub fn audio_group_interval_ms(&self) -> Option<u64> {
++		match self {
++			Self::Ts(args) => args.audio_group_interval_ms,
++			_ => None,
++		}
++	}
+ }
+ 
+ // ------------------------------------------------------------------ export
+diff --git a/rs/moq-cli/src/main.rs b/rs/moq-cli/src/main.rs
+index 35b331f9..d59ed742 100644
+--- a/rs/moq-cli/src/main.rs
++++ b/rs/moq-cli/src/main.rs
+@@ -147,7 +147,12 @@ async fn run_import(moq: MoqSide, import: Import, net: Net) -> anyhow::Result<()
+ 		let broadcast = origin
+ 			.create_broadcast(&name, moq_net::broadcast::Route::new().with_announce(true))
+ 			.context("failed to create broadcast")?;
+-		local = Some(Publish::new(broadcast, &format)?);
++		local = Some(Publish::new(
++			broadcast,
++			&format,
++			import.source.scte35_pid(),
++			import.source.audio_group_interval_ms(),
++		)?);
+ 	} else {
+ 		match import.source {
+ 			ImportSource::Hls(hls) => {
+diff --git a/rs/moq-cli/src/publish.rs b/rs/moq-cli/src/publish.rs
+index a51d94ba..5cea3e87 100644
+--- a/rs/moq-cli/src/publish.rs
++++ b/rs/moq-cli/src/publish.rs
+@@ -217,7 +217,12 @@ pub struct Publish {
+ impl Publish {
+ 	/// Build a publisher decoding the given container format from stdin into
+ 	/// `broadcast` (typically created on the origin that announces it).
+-	pub fn new(mut broadcast: moq_net::broadcast::Producer, format: &PublishFormat) -> anyhow::Result<Self> {
++	pub fn new(
++		mut broadcast: moq_net::broadcast::Producer,
++		format: &PublishFormat,
++		scte35_pid: Option<u16>,
++		audio_group_interval_ms: Option<u64>,
++	) -> anyhow::Result<Self> {
+ 		// TS carries undecoded elementary streams (SCTE-35, teletext, DVB AC-3, ...)
+ 		// verbatim, so it uses the `mpegts` catalog extension rather than the media-only
+ 		// `()`. The catalog producer owns the broadcast's catalog tracks, so each broadcast
+@@ -227,7 +232,9 @@ impl Publish {
+ 				&mut broadcast,
+ 				moq_mux::catalog::hang::Catalog::<ts::Ext>::default(),
+ 			)?;
+-			let ts = ts::Import::new(broadcast.clone(), catalog.reserve());
++			let ts = ts::Import::new(broadcast.clone(), catalog.reserve())
++				.with_scte35_pid(scte35_pid)
++				.with_audio_group_interval_ms(audio_group_interval_ms)?;
+ 			return Ok(Self {
+ 				source: Source::Stream(PublishDecoder::Ts(Box::new(ts))),
+ 				broadcast,
+@@ -577,7 +584,7 @@ mod tests {
+ 			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
+ 			.unwrap();
+ 		settle().await;
+-		let mut publish = Publish::new(broadcast, &PublishFormat::Ts).unwrap();
++		let mut publish = Publish::new(broadcast, &PublishFormat::Ts, None, None).unwrap();
+ 		#[allow(irrefutable_let_patterns)]
+ 		let Source::Stream(decoder) = &mut publish.source else {
+ 			panic!("expected a stream source");
+diff --git a/rs/moq-mux/src/codec/aac/import.rs b/rs/moq-mux/src/codec/aac/import.rs
+index 0aa7e601..c8bb39f4 100644
+--- a/rs/moq-mux/src/codec/aac/import.rs
++++ b/rs/moq-mux/src/codec/aac/import.rs
+@@ -11,6 +11,10 @@ use crate::container::Frame;
+ pub struct Import<E: CatalogExt = ()> {
+ 	track: crate::container::Producer<crate::catalog::hang::Container>,
+ 	rendition: crate::catalog::AudioTrack<E>,
++	/// When set, groups span at most this much presentation time instead of one packet.
++	group_interval: Option<moq_net::Timestamp>,
++	/// Timestamp the current group was opened at, when batching.
++	group_start: Option<moq_net::Timestamp>,
+ }
+ 
+ impl<E: CatalogExt> Import<E> {
+@@ -34,9 +38,19 @@ impl<E: CatalogExt> Import<E> {
+ 				.producer()
+ 				.media_producer(track, crate::catalog::hang::Container::Legacy),
+ 			rendition,
++			group_interval: None,
++			group_start: None,
+ 		}
+ 	}
+ 
++	/// Batch packets into groups spanning at most `interval` of presentation time (e.g. one
++	/// group per second, to match a video GOP) instead of one group per packet. See the
++	/// struct docs for the latency/resilience trade-off before enabling this.
++	pub fn with_group_interval(mut self, interval: Option<moq_net::Timestamp>) -> Self {
++		self.group_interval = interval;
++		self
++	}
++
+ 	/// The MoQ track name this importer publishes on.
+ 	pub fn name(&self) -> &str {
+ 		self.track.name()
+@@ -58,6 +72,7 @@ impl<E: CatalogExt> Import<E> {
+ 	/// Finish the track, flushing the current group.
+ 	pub fn finish(&mut self) -> crate::Result<()> {
+ 		self.rendition.record_group_end(None);
++		self.group_start = None;
+ 		self.track.finish()?;
+ 		Ok(())
+ 	}
+@@ -71,6 +86,7 @@ impl<E: CatalogExt> Import<E> {
+ 	/// Cut the current group at `end` without finishing the track.
+ 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
+ 		self.rendition.record_group_end(end);
++		self.group_start = None;
+ 		self.track.cut(end)?;
+ 		Ok(())
+ 	}
+@@ -78,22 +94,48 @@ impl<E: CatalogExt> Import<E> {
+ 	/// Close the current group and open the next one at `sequence`.
+ 	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
+ 		self.rendition.record_group_end(None);
++		self.group_start = None;
+ 		self.track.seek(sequence)?;
+ 		Ok(())
+ 	}
+ 
+-	/// Publish one AAC packet as its own group, stamping `pts` or a wall clock when absent.
++	/// Publish one AAC packet. By default it's its own group;
++	/// with [`with_group_interval`](Self::with_group_interval) set, the group instead
++	/// stays open until `interval` of presentation time has accumulated.
+ 	pub fn decode<B: moq_net::IntoBytes>(&mut self, frame: B, pts: Option<moq_net::Timestamp>) -> crate::Result<()> {
+ 		let timestamp = self.rendition.timestamp(pts)?;
+-		self.rendition.record_group_end(Some(timestamp));
++
++		let starts_new_group = match self.group_interval {
++			None => true,
++			Some(interval) => match self.group_start {
++				None => true,
++				Some(start) => {
++					let elapsed = timestamp.checked_sub(start).unwrap_or(moq_net::Timestamp::ZERO);
++					elapsed >= interval
++				}
++			},
++		};
++
++		if starts_new_group {
++			self.group_start = Some(timestamp);
++			if self.group_interval.is_some() {
++				self.rendition.record_group_end(Some(timestamp));
++			}
++		}
++
+ 		let bytes = frame.as_ref().len();
+ 		self.track.write(Frame {
+ 			timestamp,
+ 			payload: frame.into_bytes(),
+-			keyframe: true,
++			keyframe: starts_new_group,
+ 			duration: None,
+ 		})?;
+-		self.track.cut(None)?;
++
++		if self.group_interval.is_none() {
++			self.rendition.record_group_end(Some(timestamp));
++			self.track.cut(None)?;
++		}
++
+ 		self.rendition.record_frame(timestamp, bytes);
+ 		Ok(())
+ 	}
+diff --git a/rs/moq-mux/src/container/ts/catalog.rs b/rs/moq-mux/src/container/ts/catalog.rs
+index 6e2a1014..409951fd 100644
+--- a/rs/moq-mux/src/container/ts/catalog.rs
++++ b/rs/moq-mux/src/container/ts/catalog.rs
+@@ -133,6 +133,22 @@ pub struct Descriptor {
+ 	pub data: Bytes,
+ }
+ 
++/// Reference to the SCTE-35 verbatim track, published at the catalog root when
++/// the importer has been told which PID carries it (the source lacks a CUEI
++/// registration descriptor, so it can't be auto-detected from the PMT alone).
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
++#[serde(rename_all = "camelCase")]
++#[non_exhaustive]
++pub struct Scte35 {
++	/// The MoQ track name carrying the verbatim payload (also present, keyed
++	/// the same way, under `mpegts.tracks`).
++	pub track: String,
++	/// Original MPEG-TS PID, for cross-reference / debugging.
++	pub pid: u16,
++	/// PMT `stream_type` as carried (e.g. 6 for a non-conformant private-PES mux).
++	pub stream_type: u8,
++}
++
+ /// The application catalog extension carrying the `mpegts` section. Empty by
+ /// default, so the section is omitted until an MPEG-TS detail is recorded.
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+@@ -140,6 +156,12 @@ pub struct Descriptor {
+ pub struct Ext {
+ 	#[serde(default, skip_serializing_if = "Mpegts::is_empty")]
+ 	pub mpegts: Mpegts,
++
++	/// Root-level pointer to the SCTE-35 track, when identified. Kept separate
++	/// from `mpegts` so a consumer can find it without parsing the generic
++	/// verbatim-track bookkeeping.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub scte35: Option<Scte35>,
+ }
+ 
+ impl CatalogExt for Ext {}
+@@ -156,6 +178,10 @@ pub trait Catalog: CatalogExt {
+ 	/// construction, so a result that flips between `Some` and `None` mid-stream
+ 	/// would disable verbatim carriage or fail.
+ 	fn mpegts_mut(&mut self) -> Option<&mut Mpegts>;
++
++	fn scte35_mut(&mut self) -> Option<&mut Option<Scte35>> {
++		None
++	}
+ }
+ 
+ impl Catalog for () {
+@@ -176,6 +202,10 @@ impl Catalog for Ext {
+ 	fn mpegts_mut(&mut self) -> Option<&mut Mpegts> {
+ 		Some(&mut self.mpegts)
+ 	}
++
++	fn scte35_mut(&mut self) -> Option<&mut Option<Scte35>> {
++		Some(&mut self.scte35)
++	}
+ }
+ 
+ #[cfg(test)]
+@@ -219,7 +249,11 @@ mod test {
+ 			data: Bytes::from_static(b"CUEI"),
+ 		});
+ 
+-		let json = serde_json::to_string(&Ext { mpegts: mpegts.clone() }).unwrap();
++		let json = serde_json::to_string(&Ext {
++			mpegts: mpegts.clone(),
++			scte35: None,
++		})
++		.unwrap();
+ 		// Descriptor bytes are base64 ("CUEI" -> "Q1VFSQ==").
+ 		assert!(json.contains("\"Q1VFSQ==\""), "descriptor data is base64: {json}");
+ 
+diff --git a/rs/moq-mux/src/container/ts/import.rs b/rs/moq-mux/src/container/ts/import.rs
+index 55a3af4c..80dbec78 100644
+--- a/rs/moq-mux/src/container/ts/import.rs
++++ b/rs/moq-mux/src/container/ts/import.rs
+@@ -103,6 +103,14 @@ pub struct Import<E: catalog::Catalog = ()> {
+ 	/// advances it, so a cue could be stamped with another program's PTS.
+ 	last_pts: Option<Timestamp>,
+ 	media_unwrap: PtsUnwrap,
++	/// PID explicitly known to carry SCTE-35, when the source doesn't announce
++	/// it with the standard CUEI registration descriptor and it must be
++	/// disambiguated by hand from a generic private PES (stream_type 6).
++	scte35_pid: Option<u16>,
++	/// When set, batches AAC packets into groups spanning this much presentation
++	/// time instead of one group per packet. See `codec::aac::import::Import`
++	/// for the latency/resilience trade-off.
++	audio_group_interval: Option<Timestamp>,
+ }
+ 
+ impl<E: catalog::Catalog> Import<E> {
+@@ -135,9 +143,31 @@ impl<E: catalog::Catalog> Import<E> {
+ 			program_recorded: false,
+ 			last_pts: None,
+ 			media_unwrap: PtsUnwrap::default(),
++			scte35_pid: None,
++			audio_group_interval: None,
+ 		}
+ 	}
+ 
++	/// Marks a PID as SCTE-35 explicitly, for sources that don't announce it
++	/// with the standard CUEI registration descriptor. Once set, any verbatim
++	/// stream registered on this PID also publishes the catalog-root `scte35`
++	/// section, in addition to the usual `mpegts.tracks` bookkeeping.
++	pub fn with_scte35_pid(mut self, pid: Option<u16>) -> Self {
++		self.scte35_pid = pid;
++		self
++	}
++
++	/// Batches AAC packets into groups spanning `interval_ms` milliseconds of
++	/// presentation time instead of one group per packet. `None` (the default)
++	/// keeps today's per-packet grouping. Pass the same duration used for the
++	/// video encoder's GOP so audio and video groups close at roughly the same
++	/// cadence, rather than hardcoding a value here that can silently drift out
++	/// of sync with it.
++	pub fn with_audio_group_interval_ms(mut self, interval_ms: Option<u64>) -> anyhow::Result<Self> {
++		self.audio_group_interval = interval_ms.map(Timestamp::from_millis).transpose()?;
++		Ok(self)
++	}
++
+ 	/// Append `buf` to the internal scratch and demux every whole TS packet it
+ 	/// now completes. The buffer is fully consumed; a trailing partial packet
+ 	/// (< 188 bytes) is retained for the next call.
+@@ -331,6 +361,7 @@ impl<E: catalog::Catalog> Import<E> {
+ 				reserved: Some(self.catalog.reserve()),
+ 				unwrap: PtsUnwrap::default(),
+ 				jitter: None,
++				group_interval: self.audio_group_interval,
+ 			})),
+ 			// Legacy broadcast audio, carried verbatim. Both MP2 stream types
+ 			// (0x03 MPEG-1, 0x04 MPEG-2 half rate) share one parser; sample rate and
+@@ -367,6 +398,7 @@ impl<E: catalog::Catalog> Import<E> {
+ 						pid.as_u16(),
+ 						stream_type as u8,
+ 						descriptors,
++						self.scte35_pid,
+ 					) {
+ 						Ok(stream) => Stream::Verbatim(Box::new(stream)),
+ 						Err(err) => {
+@@ -435,6 +467,7 @@ impl<E: catalog::Catalog> Import<E> {
+ 			pid.as_u16(),
+ 			stream_type,
+ 			descriptors,
++			self.scte35_pid,
+ 		)?;
+ 		self.sections.insert(pid.as_u16(), stream);
+ 		self.initialized = true;
+@@ -638,6 +671,7 @@ fn register_verbatim<E: catalog::Catalog>(
+ 	stream_type: u8,
+ 	framing: catalog::Framing,
+ 	descriptors: Vec<catalog::Descriptor>,
++	scte35_pid: Option<u16>,
+ ) -> anyhow::Result<crate::container::Producer<crate::catalog::hang::Container>> {
+ 	// Verbatim payloads ride the legacy container, which normalizes the per-frame
+ 	// timestamp to microseconds on the wire (see `hang::container::Frame::encode`),
+@@ -658,6 +692,18 @@ fn register_verbatim<E: catalog::Catalog>(
+ 			verbatim: Some(catalog::Verbatim::new(stream_type, framing)),
+ 		},
+ 	);
++	// The source doesn't announce this PID as SCTE-35 via CUEI (else it would have
++	// been routed through `ensure_section`, not here) — but the caller told us
++	// explicitly which PID to treat as such, so publish the root pointer too.
++	if scte35_pid == Some(pid) {
++		if let Some(scte35) = guard.scte35_mut() {
++			*scte35 = Some(catalog::Scte35 {
++				track: track.name().to_string(),
++				pid,
++				stream_type,
++			});
++		}
++	}
+ 	drop(guard);
+ 
+ 	Ok(catalog.media_producer(track, crate::catalog::hang::Container::Legacy))
+@@ -690,6 +736,7 @@ impl<E: catalog::Catalog> SectionStream<E> {
+ 		pid: u16,
+ 		stream_type: u8,
+ 		descriptors: Vec<catalog::Descriptor>,
++		scte35_pid: Option<u16>,
+ 	) -> anyhow::Result<Self> {
+ 		let track = register_verbatim(
+ 			&mut broadcast,
+@@ -698,6 +745,7 @@ impl<E: catalog::Catalog> SectionStream<E> {
+ 			stream_type,
+ 			catalog::Framing::Section,
+ 			descriptors,
++			scte35_pid,
+ 		)?;
+ 		Ok(Self {
+ 			track,
+@@ -774,6 +822,7 @@ impl<E: catalog::Catalog> VerbatimStream<E> {
+ 		pid: u16,
+ 		stream_type: u8,
+ 		descriptors: Vec<catalog::Descriptor>,
++		scte35_pid: Option<u16>,
+ 	) -> anyhow::Result<Self> {
+ 		let track = register_verbatim(
+ 			&mut broadcast,
+@@ -782,6 +831,7 @@ impl<E: catalog::Catalog> VerbatimStream<E> {
+ 			stream_type,
+ 			catalog::Framing::Pes,
+ 			descriptors,
++			scte35_pid,
+ 		)?;
+ 		Ok(Self {
+ 			track,
+@@ -1123,6 +1173,9 @@ struct AacStream<E: CatalogExt = ()> {
+ 	unwrap: PtsUnwrap,
+ 	/// Largest audio burst span seen, published as the catalog jitter.
+ 	jitter: Option<Timestamp>,
++	/// When set, batches AAC packets into groups spanning this much presentation
++	/// time instead of one group per packet.
++	group_interval: Option<Timestamp>,
+ }
+ 
+ impl<E: CatalogExt> AacStream<E> {
+@@ -1153,7 +1206,7 @@ impl<E: CatalogExt> AacStream<E> {
+ 					// The importer synthesizes the AudioSpecificConfig `description` from the config so
+ 					// out-of-band consumers (fMP4/MKV export, WebCodecs) can configure the decoder.
+ 					let reserved = self.reserved.take().expect("aac reservation already consumed");
+-					let aac = aac::Import::new(track, reserved, config.into());
++					let aac = aac::Import::new(track, reserved, config.into()).with_group_interval(self.group_interval);
+ 					self.import.insert(aac)
+ 				}
+ 			};

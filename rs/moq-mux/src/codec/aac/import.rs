@@ -11,6 +11,10 @@ use crate::container::Frame;
 pub struct Import<E: CatalogExt = ()> {
 	track: crate::container::Producer<crate::catalog::hang::Container>,
 	rendition: crate::catalog::AudioTrack<E>,
+	/// When set, groups span at most this much presentation time instead of one packet.
+	group_interval: Option<moq_net::Timestamp>,
+	/// Timestamp the current group was opened at, when batching.
+	group_start: Option<moq_net::Timestamp>,
 }
 
 impl<E: CatalogExt> Import<E> {
@@ -34,7 +38,17 @@ impl<E: CatalogExt> Import<E> {
 				.producer()
 				.media_producer(track, crate::catalog::hang::Container::Legacy)?,
 			rendition,
+			group_interval: None,
+			group_start: None,
 		})
+	}
+
+	/// Batch packets into groups spanning at most `interval` of presentation time (e.g. one
+	/// group per second, to match a video GOP) instead of one group per packet. See the
+	/// struct docs for the latency/resilience trade-off before enabling this.
+	pub fn with_group_interval(mut self, interval: Option<moq_net::Timestamp>) -> Self {
+		self.group_interval = interval;
+		self
 	}
 
 	/// The MoQ track name this importer publishes on.
@@ -58,6 +72,7 @@ impl<E: CatalogExt> Import<E> {
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
 		self.rendition.record_group_end(None);
+		self.group_start = None;
 		self.track.finish()?;
 		Ok(())
 	}
@@ -71,6 +86,7 @@ impl<E: CatalogExt> Import<E> {
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		self.rendition.record_group_end(end);
+		self.group_start = None;
 		self.track.cut(end)?;
 		Ok(())
 	}
@@ -78,22 +94,48 @@ impl<E: CatalogExt> Import<E> {
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
 		self.rendition.record_group_end(None);
+		self.group_start = None;
 		self.track.seek(sequence)?;
 		Ok(())
 	}
 
-	/// Publish one AAC packet as its own group, stamping `pts` or a wall clock when absent.
+	/// Publish one AAC packet. By default it's its own group;
+	/// with [`with_group_interval`](Self::with_group_interval) set, the group instead
+	/// stays open until `interval` of presentation time has accumulated.
 	pub fn decode<B: moq_net::IntoBytes>(&mut self, frame: B, pts: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		let timestamp = self.rendition.timestamp(pts)?;
-		self.rendition.record_group_end(Some(timestamp));
+
+		let starts_new_group = match self.group_interval {
+			None => true,
+			Some(interval) => match self.group_start {
+				None => true,
+				Some(start) => {
+					let elapsed = timestamp.checked_sub(start).unwrap_or(moq_net::Timestamp::ZERO);
+					elapsed >= interval
+				}
+			},
+		};
+
+		if starts_new_group {
+			self.group_start = Some(timestamp);
+			if self.group_interval.is_some() {
+				self.rendition.record_group_end(Some(timestamp));
+			}
+		}
+
 		let bytes = frame.as_ref().len();
 		self.track.write(Frame {
 			timestamp,
 			payload: frame.into_bytes(),
-			keyframe: true,
+			keyframe: starts_new_group,
 			duration: None,
 		})?;
-		self.track.cut(None)?;
+
+		if self.group_interval.is_none() {
+			self.rendition.record_group_end(Some(timestamp));
+			self.track.cut(None)?;
+		}
+
 		self.rendition.record_frame(timestamp, bytes);
 		Ok(())
 	}

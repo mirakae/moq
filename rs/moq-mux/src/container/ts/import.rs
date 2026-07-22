@@ -117,6 +117,14 @@ pub struct Import<E: catalog::Catalog = ()> {
 	/// advances it, so a cue could be stamped with another program's PTS.
 	last_pts: Option<Timestamp>,
 	media_unwrap: PtsUnwrap,
+	/// PID explicitly known to carry SCTE-35, when the source doesn't announce
+	/// it with the standard CUEI registration descriptor and it must be
+	/// disambiguated by hand from a generic private PES (stream_type 6).
+	scte35_pid: Option<u16>,
+	/// When set, batches AAC packets into groups spanning this much presentation
+	/// time instead of one group per packet. See `codec::aac::import::Import`
+	/// for the latency/resilience trade-off.
+	audio_group_interval: Option<Timestamp>,
 }
 
 impl<E: catalog::Catalog> Import<E> {
@@ -152,7 +160,29 @@ impl<E: catalog::Catalog> Import<E> {
 			identity_recorded: false,
 			last_pts: None,
 			media_unwrap: PtsUnwrap::default(),
+			scte35_pid: None,
+			audio_group_interval: None,
 		}
+	}
+
+	/// Marks a PID as SCTE-35 explicitly, for sources that don't announce it
+	/// with the standard CUEI registration descriptor. Once set, any verbatim
+	/// stream registered on this PID also publishes the catalog-root `scte35`
+	/// section, in addition to the usual `mpegts.tracks` bookkeeping.
+	pub fn with_scte35_pid(mut self, pid: Option<u16>) -> Self {
+		self.scte35_pid = pid;
+		self
+	}
+
+	/// Batches AAC packets into groups spanning `interval_ms` milliseconds of
+	/// presentation time instead of one group per packet. `None` (the default)
+	/// keeps today's per-packet grouping. Pass the same duration used for the
+	/// video encoder's GOP so audio and video groups close at roughly the same
+	/// cadence, rather than hardcoding a value here that can silently drift out
+	/// of sync with it.
+	pub fn with_audio_group_interval_ms(mut self, interval_ms: Option<u64>) -> anyhow::Result<Self> {
+		self.audio_group_interval = interval_ms.map(Timestamp::from_millis).transpose()?;
+		Ok(self)
 	}
 
 	/// Append `buf` to the internal scratch and demux every whole TS packet it
@@ -356,6 +386,7 @@ impl<E: catalog::Catalog> Import<E> {
 				reserved: Some(self.catalog.reserve()),
 				unwrap: PtsUnwrap::default(),
 				jitter: None,
+				group_interval: self.audio_group_interval,
 			})),
 			// Legacy broadcast audio, carried verbatim. Both MP2 stream types
 			// (0x03 MPEG-1, 0x04 MPEG-2 half rate) share one parser; sample rate and
@@ -392,6 +423,7 @@ impl<E: catalog::Catalog> Import<E> {
 						pid.as_u16(),
 						stream_type as u8,
 						descriptors,
+						self.scte35_pid,
 					) {
 						Ok(stream) => Stream::Verbatim(Box::new(stream)),
 						Err(err) => {
@@ -460,6 +492,7 @@ impl<E: catalog::Catalog> Import<E> {
 			pid.as_u16(),
 			stream_type,
 			descriptors,
+			self.scte35_pid,
 		)?;
 		self.sections.insert(pid.as_u16(), stream);
 		self.initialized = true;
@@ -722,6 +755,7 @@ fn register_verbatim<E: catalog::Catalog>(
 	stream_type: u8,
 	framing: catalog::Framing,
 	descriptors: Vec<catalog::Descriptor>,
+	scte35_pid: Option<u16>,
 ) -> anyhow::Result<crate::container::Producer<crate::catalog::hang::Container>> {
 	// Verbatim payloads ride the legacy container, which normalizes the per-frame
 	// timestamp to microseconds on the wire (see `hang::container::Frame::encode`),
@@ -749,6 +783,18 @@ fn register_verbatim<E: catalog::Catalog>(
 			verbatim: Some(catalog::Verbatim::new(stream_type, framing)),
 		},
 	);
+	// The source doesn't announce this PID as SCTE-35 via CUEI (else it would have
+	// been routed through `ensure_section`, not here) — but the caller told us
+	// explicitly which PID to treat as such, so publish the root pointer too.
+	if scte35_pid == Some(pid) {
+		if let Some(scte35) = guard.scte35_mut() {
+			*scte35 = Some(catalog::Scte35 {
+				track: track.name().to_string(),
+				pid,
+				stream_type,
+			});
+		}
+	}
 	drop(guard);
 
 	Ok(media)
@@ -794,6 +840,7 @@ impl<E: catalog::Catalog> SectionStream<E> {
 		pid: u16,
 		stream_type: u8,
 		descriptors: Vec<catalog::Descriptor>,
+		scte35_pid: Option<u16>,
 	) -> anyhow::Result<Self> {
 		let track = register_verbatim(
 			&mut broadcast,
@@ -802,6 +849,7 @@ impl<E: catalog::Catalog> SectionStream<E> {
 			stream_type,
 			catalog::Framing::Section,
 			descriptors,
+			scte35_pid,
 		)?;
 		let entry = VerbatimEntry {
 			name: track.name().to_string(),
@@ -875,6 +923,7 @@ impl<E: catalog::Catalog> VerbatimStream<E> {
 		pid: u16,
 		stream_type: u8,
 		descriptors: Vec<catalog::Descriptor>,
+		scte35_pid: Option<u16>,
 	) -> anyhow::Result<Self> {
 		let track = register_verbatim(
 			&mut broadcast,
@@ -883,6 +932,7 @@ impl<E: catalog::Catalog> VerbatimStream<E> {
 			stream_type,
 			catalog::Framing::Pes,
 			descriptors,
+			scte35_pid,
 		)?;
 		let entry = VerbatimEntry {
 			name: track.name().to_string(),
@@ -1221,6 +1271,9 @@ struct AacStream<E: CatalogExt = ()> {
 	unwrap: PtsUnwrap,
 	/// Largest audio burst span seen, published as the catalog jitter.
 	jitter: Option<Timestamp>,
+	/// When set, batches AAC packets into groups spanning this much presentation
+	/// time instead of one group per packet.
+	group_interval: Option<Timestamp>,
 }
 
 impl<E: CatalogExt> AacStream<E> {
@@ -1251,7 +1304,7 @@ impl<E: CatalogExt> AacStream<E> {
 					// The importer synthesizes the AudioSpecificConfig `description` from the config so
 					// out-of-band consumers (fMP4/MKV export, WebCodecs) can configure the decoder.
 					let reserved = self.reserved.take().expect("aac reservation already consumed");
-					let aac = aac::Import::new(track, reserved, config.into())?;
+					let aac = aac::Import::new(track, reserved, config.into())?.with_group_interval(self.group_interval);
 					self.import.insert(aac)
 				}
 			};
