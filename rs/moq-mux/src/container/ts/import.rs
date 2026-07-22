@@ -681,6 +681,7 @@ struct SectionStream<E: catalog::Catalog> {
 	track: crate::container::Producer<crate::catalog::hang::Container>,
 	catalog: crate::catalog::Producer<E>,
 	reassembler: SectionReassembler,
+	filter_scte35_null: bool,
 }
 
 impl<E: catalog::Catalog> SectionStream<E> {
@@ -703,6 +704,7 @@ impl<E: catalog::Catalog> SectionStream<E> {
 			track,
 			catalog,
 			reassembler: SectionReassembler::default(),
+			filter_scte35_null,
 		})
 	}
 
@@ -720,6 +722,12 @@ impl<E: catalog::Catalog> SectionStream<E> {
 
 	/// Publish one complete section as a frame in its own group.
 	fn emit(&mut self, section: Vec<u8>, pts: Timestamp) -> anyhow::Result<()> {
+		// Filter out SCTE-35 `Splice Null` (table_id 0xFC, splice_command_type 0x00) if configured
+		if self.filter_scte35_null && is_scte35_splice_null(&section) {
+			tracing::trace!("dropping SCTE-35 Splice Null section");
+			return Ok(());
+		}
+
 		let frame = crate::container::Frame {
 			timestamp: pts,
 			duration: None,
@@ -765,6 +773,10 @@ struct VerbatimStream<E: catalog::Catalog> {
 	unwrap: PtsUnwrap,
 	/// Whether the PES stream_id has been recorded into the catalog yet (once).
 	stream_id_recorded: bool,
+	/// Whether this verbatim PID was explicitly designated as SCTE-35.
+	is_scte35: bool,
+	/// When true, SCTE-35 `Splice Null` payloads are dropped.
+	filter_scte35_null: bool,
 }
 
 impl<E: catalog::Catalog> VerbatimStream<E> {
@@ -794,6 +806,11 @@ impl<E: catalog::Catalog> VerbatimStream<E> {
 	/// Publish one reassembled PES payload verbatim, in its own group, stamped with
 	/// its PTS (or zero when the PES carried none).
 	fn write(&mut self, pending: Pending) -> anyhow::Result<()> {
+		if self.is_scte35 && self.filter_scte35_null && is_scte35_splice_null(&pending.data) {
+			tracing::trace!("dropping SCTE-35 Splice Null PES payload");
+			return Ok(());
+		}
+
 		// Record the original PES stream_id once, from the first PES, so export
 		// re-emits the stream under its real id (e.g. 0xBD for teletext/DVB AC-3).
 		if !self.stream_id_recorded {
@@ -2380,4 +2397,24 @@ mod test {
 			.expect("a published verbatim frame");
 		assert_eq!(&frame.payload[..], &payload[..], "verbatim PES payload round-trips");
 	}
+}
+
+/// Helper to inspect reassembled section bytes and check if it's an SCTE-35 `Splice Null`
+/// (table_id 0xFC, splice_command_type 0x00).
+fn is_scte35_splice_null(section: &[u8]) -> bool {
+	// SCTE-35 splice_info_section: table_id at byte 0, splice_command_type at byte 14
+	if section.len() < 15 || section[0] != 0xFC {
+		return false;
+	}
+	
+	// encrypted_packet is bit 7 (MSB) of byte 4
+	let encrypted_packet = (section[4] & 0x80) != 0;
+	if encrypted_packet {
+		// Encrypted sections have a different structure; can't parse command_type
+		return false;
+	}
+	
+	// splice_command_type is at byte 14 (after the 14-byte fixed header)
+	let command_type = section[14];
+	command_type == 0x00 // 0x00 is Splice Null
 }
