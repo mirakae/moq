@@ -117,10 +117,11 @@ impl<E: CatalogExt> Import<E> {
 		};
 
 		if starts_new_group {
-			self.group_start = Some(timestamp);
-			if self.group_interval.is_some() {
+			if self.group_start.is_some() && self.group_interval.is_some() {
 				self.rendition.record_group_end(Some(timestamp));
+				self.track.cut(Some(timestamp))?;
 			}
+			self.group_start = Some(timestamp);
 		}
 
 		let bytes = frame.as_ref().len();
