@@ -874,6 +874,11 @@ impl ImportSource {
 			},
 			Self::Ts(args) => PublishFormat::Ts {
 				program: args.program.and_then(TsProgram::number),
+				options: crate::publish::TsOptions {
+					scte35_pid: args.scte35_pid.map(|pid| pid.0),
+					audio_group_interval_ms: args.audio_group_interval_ms,
+					filter_scte35_null: args.filter_scte35_null,
+				},
 			},
 			Self::Flv => PublishFormat::Flv,
 			_ => return None,
@@ -959,6 +964,23 @@ pub struct TsImport {
 	/// program. Decimal, or hex with `0x`.
 	#[usage(long, requires = "--passthrough")]
 	pub pcr_pid: Option<TsPid>,
+
+	/// PID that carries SCTE-35 cues, for a mux that doesn't announce them with the standard
+	/// 'CUEI' registration descriptor (or carries them as generic private data, stream_type 6).
+	/// Without it such a stream is not carried at all. Decimal, or hex with `0x`.
+	#[usage(long, conflicts = "--passthrough")]
+	pub scte35_pid: Option<TsPid>,
+
+	/// Batch AAC frames into groups spanning this many milliseconds of presentation time,
+	/// instead of one group per frame. Set it to the video encoder's GOP duration (e.g. `1000`
+	/// for a 1s GOP) so audio and video groups close at the same cadence. A longer group is
+	/// forwarded only once it closes, which trades latency and loss resilience for fewer streams.
+	#[usage(long, conflicts = "--passthrough")]
+	pub audio_group_interval_ms: Option<u64>,
+
+	/// Drop SCTE-35 `splice_null` heartbeat sections (command type 0x00) instead of publishing them.
+	#[usage(long, conflicts = "--passthrough")]
+	pub filter_scte35_null: bool,
 }
 
 /// An `import ts --pcr-pid` value: a PID that can carry a PCR, in decimal or `0x` hex.
@@ -1862,7 +1884,7 @@ mod tests {
 		);
 		assert!(format(&["--passthrough", "--pcr-pid", "0"]).is_none(), "the PAT");
 		assert!(format(&["--passthrough", "--pcr-pid", "clock"]).is_none());
-		assert!(matches!(format(&[]), Some(PublishFormat::Ts { program: None })));
+		assert!(matches!(format(&[]), Some(PublishFormat::Ts { program: None, .. })));
 	}
 
 	/// `import srt` takes the same `--program` as `import ts`; `export srt` has no program to pick.

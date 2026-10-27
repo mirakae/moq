@@ -10,11 +10,23 @@ pub enum PublishFormat {
 	/// Fragmented MP4 (CMAF), republished whole as CMAF when `passthrough`.
 	Fmp4 { passthrough: bool },
 	/// MPEG-TS (transport stream), limited to one `program` of a multiplex when given.
-	Ts { program: Option<u16> },
+	Ts { program: Option<u16>, options: TsOptions },
 	/// MPEG-TS published whole, paced on `pcr_pid` when given rather than the PMT's clock.
 	TsPassthrough { pcr_pid: Option<u16> },
 	/// FLV (Flash Video / RTMP).
 	Flv,
+}
+
+/// Tuning for the TS importer, set by `import ts --scte35-pid`, `--audio-group-interval-ms`, and
+/// `--filter-scte35-null`.
+#[derive(Clone, Copy, Default)]
+pub struct TsOptions {
+	/// A PID to read as SCTE-35 sections whatever the PMT says of it.
+	pub scte35_pid: Option<u16>,
+	/// Presentation time an AAC group spans, in milliseconds; one group per frame when unset.
+	pub audio_group_interval_ms: Option<u64>,
+	/// Drop SCTE-35 `splice_null` heartbeats.
+	pub filter_scte35_null: bool,
 }
 
 /// Command-line adapter for [`moq_video::encode::Codec`].
@@ -263,10 +275,14 @@ fn ts_import(
 	broadcast: &mut moq_net::broadcast::Producer,
 	config: moq_mux::catalog::Config,
 	program: Option<u16>,
+	options: TsOptions,
 ) -> anyhow::Result<(ts::Import<ts::Ext>, moq_mux::catalog::Producer<ts::Ext>)> {
 	let config = config.with_catalog(moq_mux::catalog::hang::Catalog::<ts::Ext>::default());
 	let catalog = moq_mux::catalog::Producer::new(broadcast, config)?;
-	let mut import = ts::Import::new(broadcast.clone(), catalog.timebase().reserve());
+	let mut import = ts::Import::new(broadcast.clone(), catalog.timebase().reserve())
+		.with_scte35_pid(options.scte35_pid)
+		.with_audio_group_interval_ms(options.audio_group_interval_ms)?
+		.with_filter_scte35_null(options.filter_scte35_null);
 	if let Some(program) = program {
 		import = import.with_program(program);
 	}
@@ -364,8 +380,8 @@ impl Publish {
 		config: moq_mux::catalog::Config,
 	) -> anyhow::Result<Self> {
 		// TS builds its `Ext` catalog instead of the shared `()` below.
-		if let PublishFormat::Ts { program } = *format {
-			let (ts, catalog) = ts_import(&mut broadcast, config, program)?;
+		if let PublishFormat::Ts { program, options } = *format {
+			let (ts, catalog) = ts_import(&mut broadcast, config, program, options)?;
 			return Ok(Self {
 				source: Source::Stream {
 					decoder: PublishDecoder::Ts(Box::new(ts)),
@@ -1110,7 +1126,7 @@ pub(crate) mod tests {
 		broadcast.announce(Default::default()).unwrap();
 		settle().await;
 		let mut publish =
-			Publish::from_publication(broadcast, &PublishFormat::Ts { program: None }, Default::default()).unwrap();
+			Publish::from_publication(broadcast, &PublishFormat::Ts { program: None, options: Default::default() }, Default::default()).unwrap();
 		#[cfg_attr(
 			not(feature = "capture"),
 			expect(
@@ -1465,7 +1481,7 @@ pub(crate) mod tests {
 	async fn ts_import_anchors_the_catalog_clock_on_arrival() {
 		let broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
-		let mut publish = Publish::new(broadcast, &PublishFormat::Ts { program: None }, Default::default()).unwrap();
+		let mut publish = Publish::new(broadcast, &PublishFormat::Ts { program: None, options: Default::default() }, Default::default()).unwrap();
 		#[cfg_attr(
 			not(feature = "capture"),
 			expect(
@@ -1513,7 +1529,7 @@ pub(crate) mod tests {
 		let broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
 		let echo = hang::catalog::Echo::new("viewers".to_string());
-		let mut publish = Publish::new(broadcast, &PublishFormat::Ts { program: None }, Default::default())
+		let mut publish = Publish::new(broadcast, &PublishFormat::Ts { program: None, options: Default::default() }, Default::default())
 			.unwrap()
 			.with_echo(echo.clone())
 			.unwrap();
@@ -1573,7 +1589,7 @@ pub(crate) mod tests {
 		}
 
 		let broadcast = moq_net::broadcast::Info::new().produce();
-		let publish = Publish::new(broadcast, &PublishFormat::Ts { program: None }, Default::default()).unwrap();
+		let publish = Publish::new(broadcast, &PublishFormat::Ts { program: None, options: Default::default() }, Default::default()).unwrap();
 		#[cfg_attr(
 			not(feature = "capture"),
 			expect(
@@ -1617,7 +1633,7 @@ pub(crate) mod tests {
 			file.flush().unwrap();
 			let input = tokio::fs::File::open(file.path()).await.unwrap();
 			let broadcast = moq_net::broadcast::Info::new().produce();
-			let publish = Publish::new(broadcast, &PublishFormat::Ts { program: None }, Default::default()).unwrap();
+			let publish = Publish::new(broadcast, &PublishFormat::Ts { program: None, options: Default::default() }, Default::default()).unwrap();
 			#[cfg_attr(
 				not(feature = "capture"),
 				expect(
@@ -1645,7 +1661,7 @@ pub(crate) mod tests {
 	async fn eof_finishes_the_catalog_with_its_renditions() {
 		let broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
-		let publish = Publish::new(broadcast, &PublishFormat::Ts { program: None }, Default::default()).unwrap();
+		let publish = Publish::new(broadcast, &PublishFormat::Ts { program: None, options: Default::default() }, Default::default()).unwrap();
 		let mut catalogs = hang::catalog::Catalog::<()>::subscribe(&consumer).await.unwrap();
 
 		#[cfg_attr(
@@ -1683,7 +1699,7 @@ pub(crate) mod tests {
 		const LINGER: Duration = Duration::from_secs(30);
 		let broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
-		let publish = Publish::new(broadcast, &PublishFormat::Ts { program: None }, Default::default()).unwrap();
+		let publish = Publish::new(broadcast, &PublishFormat::Ts { program: None, options: Default::default() }, Default::default()).unwrap();
 		let mut catalogs = hang::catalog::Catalog::<()>::subscribe(&consumer).await.unwrap();
 
 		#[cfg_attr(
@@ -1740,7 +1756,7 @@ pub(crate) mod tests {
 		const TS: &[u8] = include_bytes!("../../moq-mux/src/container/ts/test_data/scte35/bbb5s.ts");
 		const FMP4: &[u8] = include_bytes!("../../moq-mux/src/container/fmp4/test_data/av1.mp4");
 		for (format, input) in [
-			(PublishFormat::Ts { program: None }, TS),
+			(PublishFormat::Ts { program: None, options: Default::default() }, TS),
 			(PublishFormat::TsPassthrough { pcr_pid: None }, TS),
 			(PublishFormat::Fmp4 { passthrough: false }, FMP4),
 			(PublishFormat::Fmp4 { passthrough: true }, FMP4),
@@ -1816,7 +1832,7 @@ pub(crate) mod tests {
 		let broadcast = moq_net::broadcast::Info::new().produce();
 		let publish = Publish::new(
 			broadcast.clone(),
-			&PublishFormat::Ts { program: None },
+			&PublishFormat::Ts { program: None, options: Default::default() },
 			Default::default(),
 		)
 		.unwrap();
@@ -1855,8 +1871,8 @@ pub(crate) mod tests {
 		let flv_header = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00".to_vec();
 		let aud = vec![0, 0, 0, 1, 9, 0xf0];
 		for (format, input) in [
-			(PublishFormat::Ts { program: None }, Vec::new()),
-			(PublishFormat::Ts { program: Some(1) }, tables),
+			(PublishFormat::Ts { program: None, options: Default::default() }, Vec::new()),
+			(PublishFormat::Ts { program: Some(1), options: Default::default() }, tables),
 			(PublishFormat::Flv, flv_header),
 			(PublishFormat::Avc3, aud),
 		] {
@@ -1984,7 +2000,7 @@ pub(crate) mod tests {
 	#[test]
 	fn a_multiplex_is_refused_with_the_programs_and_the_flag() {
 		let broadcast = moq_net::broadcast::Info::new().produce();
-		let mut publish = Publish::new(broadcast, &PublishFormat::Ts { program: None }, Default::default()).unwrap();
+		let mut publish = Publish::new(broadcast, &PublishFormat::Ts { program: None, options: Default::default() }, Default::default()).unwrap();
 		#[cfg_attr(
 			not(feature = "capture"),
 			expect(

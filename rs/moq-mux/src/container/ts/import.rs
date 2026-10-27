@@ -232,6 +232,13 @@ pub struct Import<E: catalog::Catalog = ()> {
 	described: bool,
 	/// Carried PIDs already warned about a TS-scrambled packet.
 	scrambled: HashSet<u16>,
+	/// A PID the caller says carries SCTE-35 sections, for a mux that lacks the 'CUEI'
+	/// registration descriptor (or types the PID 0x06 rather than 0x86).
+	scte35_pid: Option<u16>,
+	/// Presentation time an AAC group spans before it is cut, instead of one group per frame.
+	audio_group_interval: Option<Timestamp>,
+	/// Drop SCTE-35 `splice_null` heartbeat sections instead of publishing them.
+	filter_scte35_null: bool,
 }
 
 impl<E: catalog::Catalog> Import<E> {
@@ -303,7 +310,37 @@ impl<E: catalog::Catalog> Import<E> {
 			alone: false,
 			described: false,
 			scrambled: HashSet::new(),
+			scte35_pid: None,
+			audio_group_interval: None,
+			filter_scte35_null: false,
 		}
+	}
+
+	/// Treat `pid` as a SCTE-35 section stream whatever the PMT says of it.
+	///
+	/// Without this a 0x86 stream is carried only when the program announces SCTE-35 with the
+	/// 'CUEI' registration descriptor, as 0x86 is also a DTS audio type. Use it for a mux that
+	/// leaves the descriptor out, or carries the cues as generic private data (0x06).
+	pub fn with_scte35_pid(mut self, pid: Option<u16>) -> Self {
+		self.scte35_pid = pid;
+		self
+	}
+
+	/// Batch AAC frames into groups spanning `interval_ms` milliseconds of presentation time,
+	/// instead of one group per frame. `None` keeps one group per frame.
+	///
+	/// Match it to the video GOP duration so audio and video groups close at the same cadence.
+	/// A longer group is forwarded by the relay only once it closes or fills, which trades
+	/// latency and loss resilience for fewer QUIC streams.
+	pub fn with_audio_group_interval_ms(mut self, interval_ms: Option<u64>) -> anyhow::Result<Self> {
+		self.audio_group_interval = interval_ms.map(Timestamp::from_millis).transpose()?;
+		Ok(self)
+	}
+
+	/// Drop SCTE-35 `splice_null` (command type 0x00) heartbeat sections.
+	pub fn with_filter_scte35_null(mut self, filter: bool) -> Self {
+		self.filter_scte35_null = filter;
+		self
 	}
 
 	/// Import only the program numbered `program` in the PAT, ignoring the rest of the multiplex.
@@ -688,7 +725,7 @@ impl<E: catalog::Catalog> Import<E> {
 				let listing = Listing {
 					stream_type: es.stream_type,
 					descriptors: es.descriptors.clone(),
-					sections: section_framed(es.stream_type, cuei),
+					sections: section_framed(es.stream_type, cuei, self.scte35_pid == Some(es.pid.as_u16())),
 				};
 				(es.pid, listing)
 			})
@@ -717,7 +754,7 @@ impl<E: catalog::Catalog> Import<E> {
 			}
 			// Section-framed data is reassembled as sections, never PES-parsed. Everything else
 			// routes through ensure_stream (a decoded codec, whole PES, or refused).
-			if section_framed(es.stream_type, cuei) {
+			if section_framed(es.stream_type, cuei, self.scte35_pid == Some(es.pid.as_u16())) {
 				self.ensure_section(es.pid, es.stream_type, &es.descriptors)?;
 			} else {
 				self.ensure_stream(es.pid, es.stream_type, &es.descriptors)?;
@@ -898,6 +935,8 @@ impl<E: catalog::Catalog> Import<E> {
 				tail_pts: None,
 				resync: Resync::new(pid.as_u16(), ".aac"),
 				burst: std::time::Duration::ZERO,
+				group_interval: self.audio_group_interval,
+				group_start: None,
 			})),
 			// Legacy broadcast audio, carried verbatim. Both MP2 stream types
 			// (0x03 MPEG-1, 0x04 MPEG-2 half rate) share one parser; sample rate and
@@ -1033,6 +1072,7 @@ impl<E: catalog::Catalog> Import<E> {
 			descriptors,
 		)?;
 		stream.staging = self.staging.clone();
+		stream.filter_null = self.filter_scte35_null;
 		self.sections.insert(pid.as_u16(), stream);
 		self.liveness.register(pid.as_u16());
 		self.initialized = true;
@@ -1920,9 +1960,19 @@ struct Listing {
 /// the ISO 13818-6 DSM-CC types, each of which rides DSM-CC sections (0x0A multiprotocol
 /// encapsulation, 0x0B U-N messages and carousels, 0x0C stream descriptors, 0x0D any DSM-CC
 /// section), and SCTE-35 (0x86) in a program whose descriptors carry the 'CUEI' registration.
-/// 0x86 is also a DTS audio type, so without it the stream is not read as cues.
-fn section_framed(stream_type: u8, cuei: bool) -> bool {
-	matches!(stream_type, 0x05 | 0x0a..=0x0d) || (cuei && stream_type == StreamType::Dts8ChannelLosslessAudio as u8)
+/// 0x86 is also a DTS audio type, so without it the stream is not read as cues. `forced` is a PID the
+/// caller named as SCTE-35 ([`Import::with_scte35_pid`]): it is read as sections whatever its type.
+fn section_framed(stream_type: u8, cuei: bool, forced: bool) -> bool {
+	forced
+		|| matches!(stream_type, 0x05 | 0x0a..=0x0d)
+		|| (cuei && stream_type == StreamType::Dts8ChannelLosslessAudio as u8)
+}
+
+/// Whether `section` is a SCTE-35 `splice_null` (command type 0x00), the heartbeat sent between cues.
+///
+/// `splice_command_type` is byte 13 of a `splice_info_section` (table_id 0xFC).
+fn is_splice_null(section: &[u8]) -> bool {
+	section.len() >= 14 && section[0] == 0xFC && section[13] == 0x00
 }
 
 // Match the raw TS accumulator: half a MoQ group bounds one program's staged input.
@@ -2120,6 +2170,8 @@ struct SectionStream<E: catalog::Catalog> {
 	/// Sections waiting for the next PCR or the timebase's offset, in input order.
 	held: VecDeque<Held>,
 	staging: Arc<Staging>,
+	/// Drop SCTE-35 `splice_null` heartbeats instead of holding them for publication.
+	filter_null: bool,
 }
 
 impl<E: catalog::Catalog> SectionStream<E> {
@@ -2147,6 +2199,7 @@ impl<E: catalog::Catalog> SectionStream<E> {
 			reassembler: SectionReassembler::default(),
 			held: VecDeque::new(),
 			staging: Arc::default(),
+			filter_null: false,
 		})
 	}
 
@@ -2157,6 +2210,9 @@ impl<E: catalog::Catalog> SectionStream<E> {
 		self.reassembler.push_at(pkt, Some((at, placement)), &mut completed);
 		let mut unplaced = 0;
 		for (span, section) in completed {
+			if self.filter_null && is_splice_null(&section) {
+				continue;
+			}
 			let Some(span) = span else {
 				unplaced += 1;
 				continue;
@@ -3635,6 +3691,10 @@ struct AacStream<E: CatalogExt = ()> {
 	resync: Resync,
 	// Completed audio duration since the last video PES, measured independently for each PID.
 	burst: std::time::Duration,
+	/// Presentation time a group spans before it is cut; `None` cuts every frame.
+	group_interval: Option<Timestamp>,
+	/// PTS of the first frame of the group now open, while one spans several frames.
+	group_start: Option<Timestamp>,
 }
 
 impl<E: CatalogExt> AacStream<E> {
@@ -3817,16 +3877,30 @@ impl<E: CatalogExt> AacStream<E> {
 			import.decode(block, pts)?;
 			// Count only completed frames; input gaps and unfinished tails are not a media burst.
 			burst += std::time::Duration::from_nanos((1024_u64 * 1_000_000_000).div_ceil(header.sample_rate as u64));
-			// The importer accumulates; cut each ADTS frame into its own group (one QUIC stream)
-			// so the relay forwards it without waiting for the next.
-			import.cut(None)?;
+			// The importer accumulates. By default cut each ADTS frame into its own group (one QUIC
+			// stream) so the relay forwards it without waiting for the next; with a group interval,
+			// let the group span that much presentation time first, to close at the video GOP's cadence.
+			// A frame without a PTS cannot be measured, so it cuts as the default does.
+			let frame = pts;
+			// Every ADTS frame is 1024 samples.
+			pts = advance_pts(pts, 1024, header.sample_rate)?;
+			let cut = match (self.group_interval, frame, pts) {
+				(Some(interval), Some(frame), Some(end)) => {
+					let start = *self.group_start.get_or_insert(frame);
+					let elapsed = end.checked_sub(start).unwrap_or(Timestamp::ZERO);
+					elapsed >= interval.convert(end.scale())?
+				}
+				_ => true,
+			};
+			if cut {
+				import.cut(None)?;
+				self.group_start = None;
+			}
 			self.resync.published(unvouched);
 			published += 1;
 			// Offsets behind the published frame are spent; carrying one would republish it.
 			fallback = None;
 
-			// Every ADTS frame is 1024 samples.
-			pts = advance_pts(pts, 1024, header.sample_rate)?;
 			offset = end;
 		}
 
@@ -11052,5 +11126,48 @@ pub(super) mod test {
 			.unwrap();
 
 		assert!(catalog.snapshot().ext.mpegts.program_descriptors.is_empty());
+	}
+}
+
+#[cfg(test)]
+mod scte35_options_tests {
+	use super::{is_splice_null, section_framed};
+
+	/// A `splice_info_section` header up to `splice_command_type` (byte 13).
+	fn section(command_type: u8) -> Vec<u8> {
+		let mut section = vec![0xFC, 0x30, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xF0, 0x00];
+		section.push(command_type);
+		section.extend_from_slice(&[0, 0, 0, 0]);
+		section
+	}
+
+	#[test]
+	fn splice_null_is_command_type_zero() {
+		assert!(is_splice_null(&section(0x00)));
+		// splice_insert and time_signal are the cues, not heartbeats.
+		assert!(!is_splice_null(&section(0x05)));
+		assert!(!is_splice_null(&section(0x06)));
+	}
+
+	#[test]
+	fn splice_null_ignores_other_tables_and_short_input() {
+		let mut other = section(0x00);
+		other[0] = 0x42;
+		assert!(!is_splice_null(&other));
+		assert!(!is_splice_null(&section(0x00)[..13]));
+		assert!(!is_splice_null(&[]));
+	}
+
+	#[test]
+	fn forced_pid_is_read_as_sections_whatever_its_type() {
+		// 0x86 without CUEI is ambiguous (DTS), and 0x06 is generic private PES: neither is sections...
+		assert!(!section_framed(0x86, false, false));
+		assert!(!section_framed(0x06, false, false));
+		// ...until the caller names the PID.
+		assert!(section_framed(0x86, false, true));
+		assert!(section_framed(0x06, false, true));
+		// CUEI still marks 0x86, and private sections (0x05) never needed either.
+		assert!(section_framed(0x86, true, false));
+		assert!(section_framed(0x05, false, false));
 	}
 }
